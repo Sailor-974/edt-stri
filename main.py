@@ -229,7 +229,7 @@ def analyser_page(page, resultats):
                                   "salle_a_attribuer": a_attribuer,
                                   "type": "Contrôle" if couleur == "JAUNE" else "Cours"})
 
-def generer_ics(resultats, nom_fichier="edt-7f3k9x2m.ics"):
+def generer_ics(resultats, nom_fichier="edt-STRI-2026-2027.ics"):
     cal = Calendar()
     cal.add('prodid', '-//EDT STRI Automatique//')
     cal.add('version', '2.0')
