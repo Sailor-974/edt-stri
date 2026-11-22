@@ -3,8 +3,8 @@ name: Mise à jour EDT STRI
 on:
   schedule:
     # Format Cron (UTC) : Minutes Heures Jour Mois JourSemaine
-    # Correspond à 6h, 12h, 18h et 22h heure de Paris (Hiver)
-    - cron: '0 4,10,16,20 * * *'
+    
+    - cron: '0 4-23 * * *'
   workflow_dispatch: # Bouton pour lancer manuellement depuis l'interface GitHub
 
 permissions:
