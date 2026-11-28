@@ -30,6 +30,7 @@ RE_HEURE = re.compile(r"^(\d{1,2})h$")
 RE_NUM_SEMAINE = re.compile(r"^\d{2}$")
 RE_DATE = re.compile(r"^(\d{1,2})/([^\d/\s]+)$")
 RE_TP = re.compile(r"\s*(?:[-–]\s*)?\(?\bTP[A-Z]\b\)?")
+RE_TPG = re.compile(r"\bTP[A-Z]\b")
 RE_CODE = re.compile(r"^[A-Z]{2,}\d[A-Z0-9]*$")
 RE_INITIALES = re.compile(r"[A-Za-z]{2,5}(?: ?& ?[A-Za-z]{2,5})?")   # GR, AnAn, ME & OM...
 ECART_MAX = 15      # écart max (points) entre deux textes d'une même case
@@ -150,18 +151,24 @@ def fin_par_defaut(debut, trois_heures):
 # ------------------------------------------------------------
 def construire_cellules(spans_ligne, labels, rouges, dessins):
     """Regroupe les textes d'une ligne en cases. La salle est le texte de type salle
-    (ou tout texte posé dans une case rouge) qui suit la case sur la même ligne."""
+    (ou tout texte posé dans une case rouge) qui suit la case sur la même ligne.
+    Une salle sans texte avant elle donne une case « salle seule » (parts vide)."""
     cellules = []
     for s in sorted(spans_ligne, key=lambda s: s["x0"]):
         if RE_SALLE.match(s["t"]) or dans_rouge(s, rouges):
-            if cellules and cellules[-1]["salle"] is None:
-                _, rect = fond_en(dessins, pymupdf.Point((s["x0"] + s["x1"]) / 2, s["y"]))
-                x_salle = rect.x1 if rect is not None and rect.width < 200 else s["x1"]
-                cellules[-1]["salle"] = s["t"]
-                cellules[-1]["x_salle"] = x_salle
+            _, rect = fond_en(dessins, pymupdf.Point((s["x0"] + s["x1"]) / 2, s["y"]))
+            x_salle = rect.x1 if rect is not None and rect.width < 200 else s["x1"]
+            cur = cellules[-1] if cellules else None
+            if (cur is not None and cur["parts"] and cur["salle"] is None
+                    and heure_depuis_x(labels, s["x0"]) <= cur["debut"] + 3.3):
+                cur["salle"], cur["x_salle"] = s["t"], x_salle
+            else:
+                cellules.append({"debut": None, "parts": [], "salle": s["t"],
+                                 "x_salle": x_salle, "x_room": s["x0"]})
             continue
         cur = cellules[-1] if cellules else None
-        if cur is not None and cur["salle"] is None and s["x0"] - cur["parts"][-1]["x1"] <= ECART_MAX:
+        if (cur is not None and cur["parts"] and cur["salle"] is None
+                and s["x0"] - cur["parts"][-1]["x1"] <= ECART_MAX):
             cur["parts"].append(s)
         else:
             t = heure_depuis_x(labels, s["x0"] - MARGE_TEXTE)
@@ -174,6 +181,12 @@ def texte(cell):
     return " ".join(p["t"] for p in cell["parts"])
 
 
+def est_detail(t):
+    """Texte de la ligne du bas qui complète une case sur deux lignes (initiales du prof,
+    commentaire...) et non un cours de l'autre groupe (qui a des parenthèses ou un groupe de TP)."""
+    return RE_INITIALES.fullmatch(t) is not None or ("(" not in t and not RE_TPG.search(t))
+
+
 def analyser_intitule(brut):
     """Sépare matière, prof, groupe de TP et code projet.
     'Tech. de trans. (TPB) (EG)' -> ('Tech. de trans.', 'EG', 'TPB', '')
@@ -181,7 +194,7 @@ def analyser_intitule(brut):
     'Phy (Réseaux) (RK)'         -> ('Phy (Réseaux)', 'RK', '', '')
     'Sport ((Rattrapage)'        -> ('Sport (Rattrapage)', '', '', '')"""
     brut = brut.replace("((", "(")
-    m = re.search(r"\bTP[A-Z]\b", brut)
+    m = RE_TPG.search(brut)
     groupe = m.group(0) if m else ""
     txt = RE_TP.sub("", brut).strip(" -–")
     prof, code = "", ""
@@ -255,11 +268,14 @@ def analyser_page(page, resultats):
             spans_jour = [s for s in grille if haut <= s["y"] < bas]
             ligne1 = construire_cellules([s for s in spans_jour if s["y"] < milieu], labels, rouges, dessins)
             ligne2 = construire_cellules([s for s in spans_jour if s["y"] >= milieu], labels, rouges, dessins)
-            l2 = {c2["debut"]: c2 for c2 in ligne2}
+            l2 = {c2["debut"]: c2 for c2 in ligne2 if c2["parts"]}
+            orphelines = [c2 for c2 in ligne2 if not c2["parts"]]   # salles seules en bas
             communs = set()
 
             print(f"\n[{jour} {(lundi + timedelta(days=k)).strftime('%d/%m')}]")
             for cell in ligne1:
+                if not cell["parts"]:
+                    continue
                 p0 = cell["parts"][0]
                 couleur, rect = fond_en(dessins, pymupdf.Point(p0["x0"] + 3, p0["y"]))
                 colore = rect is not None and couleur in ("ORANGE", "JAUNE")
@@ -279,22 +295,41 @@ def analyser_page(page, resultats):
                 matiere, prof, groupe, code = analyser_intitule(texte(cell))
                 trois_h = bool(groupe or code)
 
-                # Case commune : la ligne du bas ne contient que du texte en italique
+                # Ligne du bas sous la même case : texte, ou salle seule
                 cell2 = l2.get(debut)
-                commun = cell2 is not None and all(p["it"] for p in cell2["parts"])
+                if cell2 is None:
+                    x_deb = interpoler(labels, debut) - 10
+                    x_suiv = min((interpoler(labels, c1["debut"]) for c1 in ligne1
+                                  if c1["parts"] and c1["debut"] > debut), default=float("inf"))
+                    for o in orphelines:
+                        if x_deb <= o["x_room"] < x_suiv:
+                            cell2 = o
+                            break
+
+                # Case sur deux lignes (CM, contrôle, projet) : la ligne du bas complète la case
+                commun = False
+                if cell2 is not None:
+                    if not cell2["parts"]:
+                        commun = not cell["salle"]
+                    else:
+                        commun = (all(p["it"] for p in cell2["parts"])
+                                  or (not cell["salle"] and est_detail(texte(cell2))))
+
                 if commun:
                     communs.add(debut)
-                    detail = texte(cell2)
-                    if RE_INITIALES.fullmatch(detail):
-                        prof = detail                                  # initiales du prof
-                    else:
-                        matiere = f"{matiere} - {detail}"              # ex. « Travail en autonomie »
+                    if cell2["parts"]:
+                        detail = texte(cell2)
+                        if RE_INITIALES.fullmatch(detail):
+                            prof = detail                                  # initiales du prof
+                        else:
+                            matiere = f"{matiere} - {detail}"              # ex. « Travail en autonomie »
                     salle = cell2["salle"] or cell["salle"]
                     x_salle = cell2["x_salle"] or cell["x_salle"]
                     y_lo, y_hi = haut, bas
                 else:
                     salle, x_salle = cell["salle"], cell["x_salle"]
                     y_lo, y_hi = haut, milieu
+                format_cours = "CM" if commun else "TD/TP"
 
                 if groupe and GROUPE_TP and groupe != GROUPE_TP:
                     if DEBUG:
@@ -346,16 +381,18 @@ def analyser_page(page, resultats):
                 infos = [f"prof {prof or '—'}", f"salle {salle_aff}"]
                 if groupe:
                     infos.append(groupe)
-                print(f"  {fmt(debut)}-{fmt(fin)} : {prefixe}{matiere} | " + " | ".join(infos) + alerte)
+                print(f"  {fmt(debut)}-{fmt(fin)} [{format_cours}] : {prefixe}{matiere} | "
+                      + " | ".join(infos) + alerte)
 
                 resultats.append({"date": lundi + timedelta(days=k), "debut": fmt(debut), "fin": fmt(fin),
                                   "matiere": matiere, "prof": prof, "salle": salle or "",
                                   "salle_a_attribuer": a_attribuer, "groupe": groupe, "code": code,
+                                  "format": format_cours,
                                   "type": "Contrôle" if couleur == "JAUNE" else "Cours"})
 
             if DEBUG:
                 for cell2 in ligne2:
-                    if cell2["debut"] not in communs:
+                    if cell2["parts"] and cell2["debut"] not in communs:
                         print(f"  REJETÉ (ligne 2, G2) {fmt(cell2['debut'])} : {texte(cell2)}")
 
 
@@ -395,14 +432,17 @@ def generer_ics(resultats, nom_fichier="edt-STRI-2026-2027.ics"):
             event.add("location", cours["salle"])
 
         details = []
+        if cours["format"] == "CM":
+            details.append("Format : CM / classe entière (tous les groupes)")
+        else:
+            details.append(f"Format : TD/TP ({GROUPE_TP})" if GROUPE_TP else "Format : TD/TP")
         if cours["groupe"]:
             details.append(f"Groupe : {cours['groupe']}")
         if cours["code"]:
             details.append(f"Code : {cours['code']}")
         if cours["salle_a_attribuer"]:
             details.append("Salle pas encore attribuée")
-        if details:
-            event.add("description", "\n".join(details))
+        event.add("description", "\n".join(details))
 
         # Identifiant stable : date + heure + matière + groupe (sans la salle, pour les mises à jour)
         uid = hashlib.md5(
